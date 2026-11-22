@@ -99,6 +99,20 @@ UserAccessPermissionsの定数を使います
 """
 USER_PERMISSIONS = 0
 
+# PDF仕様で「1にしておく」と決められている予約ビット (7, 8, 13〜32ビット目)
+# 権限0を指定しても、この予約ビットは立てたまま暗号化します
+_PERMISSION_FLAGS = (
+    UserAccessPermissions.PRINT
+    | UserAccessPermissions.MODIFY
+    | UserAccessPermissions.EXTRACT
+    | UserAccessPermissions.ADD_OR_MODIFY
+    | UserAccessPermissions.FILL_FORM_FIELDS
+    | UserAccessPermissions.EXTRACT_TEXT_AND_GRAPHICS
+    | UserAccessPermissions.ASSEMBLE_DOC
+    | UserAccessPermissions.PRINT_TO_REPRESENTATION
+)
+_RESERVED_BITS = 0xFFFFFFFC & ~int(_PERMISSION_FLAGS)
+
 """
 SAFE_DIRECTORY: 入力フォルダと出力フォルダが一致している場合にエラー終了するかどうか
 
@@ -155,7 +169,7 @@ def encrypt(source_pdf_file: Path, output_folder: Path, owner_password, user_pas
             pdf_writer.append(pypdf.PdfReader(source, strict=False))
             pdf_writer.encrypt(user_password=user_password if SET_USER_PASSWORD else "",
                                owner_password=owner_password if SET_OWNER_PASSWORD else "",
-                               permissions_flag=0,
+                               permissions_flag=int(USER_PERMISSIONS) | _RESERVED_BITS,
                                algorithm="AES-256")
         except EmptyFileError as err:
             # PDFの中身が壊れてる場合は処理しない
@@ -207,6 +221,10 @@ class FileEventHandler(LoggingEventHandler):
         """
         if not path.lower().endswith(".pdf"):
             return
+        if is_same_or_inside(Path(path).resolve(), Path(self.output_folder).resolve()):
+            # SAFE_DIRECTORY = False で起動した場合でも、出力先のファイルは処理しない
+            logger.debug("出力先のファイルなのでスキップ: %s", path)
+            return
         try:
             logger.info("パスワードロックを行います: %s", path)
             encrypt(Path(path), Path(self.output_folder),
@@ -239,6 +257,17 @@ class FileEventHandler(LoggingEventHandler):
         return super().on_modified(event)
 
 
+def is_same_or_inside(path: Path, folder: Path) -> bool:
+    """
+    path が folder と同じか、folder の中 (サブフォルダ含む) にあれば True を返します
+    """
+    try:
+        path.relative_to(folder)
+        return True
+    except ValueError:
+        return False
+
+
 def main():
     if len(sys.argv) - 1 < 3:  # argv[0] は自分のパス
         executable = Path(sys.argv[0]).name
@@ -251,8 +280,19 @@ def main():
     output_folder = Path(sys.argv[2])
     owner_password = sys.argv[3]
 
-    if input_folder == output_folder:
-        logger.warning("入力フォルダと出力フォルダが同じフォルダです")
+    if not input_folder.is_dir():
+        logger.error("監視フォルダが見つかりません: %s", input_folder)
+        os._exit(1)
+        return
+
+    # 相対パスや ".." を含むパスでも正しく比較できるよう、絶対パスに直してから比べる
+    # (出力先はまだ存在しなくても resolve できる)
+    input_resolved = input_folder.resolve()
+    output_resolved = output_folder.resolve()
+    if is_same_or_inside(output_resolved, input_resolved):
+        # 出力先が監視フォルダと同じ、または監視フォルダの中にあると、
+        # 出力したPDFを再び検知して処理し続ける (無限ループ) ため止める
+        logger.warning("出力先が監視フォルダと同じか、監視フォルダの中にあります: %s", output_resolved)
         if SAFE_DIRECTORY:
             logger.error("終了します")
             os._exit(1)
