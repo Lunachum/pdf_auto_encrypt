@@ -39,7 +39,7 @@ BACKUP_FOLDER: バックアップファイルをバックアップフォルダ�
 よくわからなければ True のままにします
 
 バックアップファイルをバックアップフォルダに作ります。
-バックアップフォルダは 出力先\.backups フォルダです
+バックアップフォルダは 出力先\\.backups フォルダです
 """
 BACKUP_FOLDER = True
 
@@ -218,11 +218,12 @@ def encrypt(source_pdf_file: Path, output_folder: Path, owner_password, user_pas
         if BACKUP_FOLDER:
             backup_folder = dest_pdf_file.with_name(".backups")
             backup_folder.mkdir(exist_ok=True)
-        bak_dest = dest_pdf_file
+        # 例: 注文書.pdf -> 注文書.0.bak.pdf, 注文書.1.bak.pdf ...
+        # (末尾を .pdf にして、バックアップもそのままPDFとして開けるようにする)
+        bak_dest = backup_folder / f"{dest_pdf_file.stem}.{bak_count}.bak.pdf"
         while bak_dest.exists():
-            bak_dest = (backup_folder /
-                        dest_pdf_file.name).with_suffix(f".{bak_count}.bak")
             bak_count += 1
+            bak_dest = backup_folder / f"{dest_pdf_file.stem}.{bak_count}.bak.pdf"
 
         if BACKUP_ENABLED and dest_pdf_file.exists():
             logger.info("出力先に同じ名前のPDFファイルがあるため、バックアップします")
