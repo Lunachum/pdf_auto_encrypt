@@ -5,6 +5,7 @@ import time
 import sys
 import logging
 import threading
+from getpass import getpass
 from pathlib import Path
 
 import pypdf
@@ -161,6 +162,10 @@ LOCALIZE_LOGLEVEL: ログレベルを日本語化するかどうか
 LOCALIZE_LOGLEVEL = True
 
 # ==================================
+
+# パスワードを渡す環境変数の名前
+ENV_OWNER_PASSWORD = "PDF_OWNER_PASSWORD"
+ENV_USER_PASSWORD = "PDF_USER_PASSWORD"
 
 
 logging.basicConfig(
@@ -394,17 +399,60 @@ def is_same_or_inside(path: Path, folder: Path) -> bool:
         return False
 
 
+def ask_password(prompt: str, allow_empty: bool) -> str:
+    """
+    画面にパスワードを表示せずに入力してもらいます (確認のため 2 回入力)
+    """
+    while True:
+        password = getpass(prompt)
+        if password == "" and allow_empty:
+            return ""
+        if password.strip() == "":
+            print("空のパスワードは使えません。もう一度入力してください")
+            continue
+        if getpass("確認のため、もう一度入力してください: ") == password:
+            return password
+        print("パスワードが一致しません。もう一度入力してください")
+
+
+def read_passwords():
+    """
+    オーナーパスワードとユーザーパスワードを読み込みます
+
+    - 環境変数 PDF_OWNER_PASSWORD が設定されていれば環境変数から読み込む
+      (ユーザーパスワードは PDF_USER_PASSWORD。設定されていなければユーザーパスワードなし)
+    - 設定されていなければ画面から入力してもらう
+
+    コマンド引数で渡すと、タスクマネージャーやコマンド履歴からパスワードが見えてしまうため使いません
+    """
+    owner_password = os.environ.get(ENV_OWNER_PASSWORD)
+    if owner_password is not None:
+        logger.info("環境変数 %s からパスワードを読み込みました", ENV_OWNER_PASSWORD)
+        user_password = os.environ.get(ENV_USER_PASSWORD, "")
+    else:
+        owner_password = ask_password("オーナーパスワード: ", allow_empty=False)
+        if SET_USER_PASSWORD:
+            user_password = ask_password(
+                "ユーザーパスワード (閲覧用。設定しない場合は空のまま Enter): ", allow_empty=True)
+        else:
+            user_password = ""
+    return owner_password, user_password
+
+
 def main():
-    if len(sys.argv) - 1 < 3:  # argv[0] は自分のパス
+    if len(sys.argv) - 1 != 2:  # argv[0] は自分のパス
         executable = Path(sys.argv[0]).name
         print("使用法:", executable,
-              "<元のPDFを入れるフォルダ> <パスワードロックされたPDFの出力先> <オーナーパスワード> [ユーザーパスワード]")
+              "<元のPDFを入れるフォルダ> <パスワードロックされたPDFの出力先>")
+        print("パスワードは起動後に画面から入力するか、環境変数",
+              ENV_OWNER_PASSWORD, "/", ENV_USER_PASSWORD, "で指定します")
+        if len(sys.argv) - 1 > 2:
+            print("※ パスワードをコマンド引数で渡す方法は、安全のため使えなくなりました")
         os._exit(-1)
         return
 
     input_folder = Path(sys.argv[1])
     output_folder = Path(sys.argv[2])
-    owner_password = sys.argv[3]
 
     if not input_folder.is_dir():
         logger.error("監視フォルダが見つかりません: %s", input_folder)
@@ -424,20 +472,20 @@ def main():
             os._exit(1)
             return
 
+    owner_password, user_password = read_passwords()
+
     if owner_password.strip() == "":
         logger.warning("オーナーパスワードが空です")
 
-    if len(sys.argv) - 1 >= 4:
-        user_password = sys.argv[4]
+    if user_password != "":
         if not SET_USER_PASSWORD:
             logger.error("ユーザーパスワードが設定されていますが、SET_USER_PASSWORD フラグが False です")
             logger.error("SET_USER_PASSWORD フラグを True にした状態で再度実行してください")
             return
         logger.info("ユーザーパスワードが設定されました")
         if user_password.strip() == "":
-            logger.warning("ユーザーパスワードが空の文字列です")
+            logger.warning("ユーザーパスワードが空白だけです")
     else:
-        user_password = ""
         logger.info("ユーザーパスワードは設定されていません")
 
     print("監視フォルダ:", input_folder.resolve())
