@@ -4,6 +4,7 @@ import os
 import time
 import sys
 import logging
+import threading
 from pathlib import Path
 
 import pypdf
@@ -11,7 +12,7 @@ from pypdf.constants import UserAccessPermissions
 from pypdf.errors import PdfReadError, EmptyFileError
 
 from watchdog.observers import Observer
-from watchdog.events import LoggingEventHandler, FileCreatedEvent, FileModifiedEvent
+from watchdog.events import LoggingEventHandler, FileCreatedEvent, FileModifiedEvent, FileMovedEvent
 
 
 # === 設定 =========================
@@ -44,12 +45,13 @@ BACKUP_FOLDER = True
 """
 HOOK_ON_CREATED: ファイル作成時に自動処理するかどうか
 
-デフォルト: False
-よくわからなければ False のままにします
+デフォルト: True
+よくわからなければ True のままにします
 
-新規作成時も on_modified が呼ばれるようなので、基本的には False のままで良いです
+別のフォルダから移動してきたPDFは on_modified が呼ばれないことがあるため、作成時も処理します。
+作成と変更の両方で呼ばれても、SETTLE_SECONDS の待ち合わせでまとめて 1 回だけ処理します
 """
-HOOK_ON_CREATED = False
+HOOK_ON_CREATED = True
 
 """
 HOOK_ON_MODIFIED: ファイル変更時に自動処理するかどうか
@@ -60,6 +62,29 @@ HOOK_ON_MODIFIED: ファイル変更時に自動処理するかどうか
 監視対象フォルダ内のファイル内容が変更されたときに保護処理を実行します
 """
 HOOK_ON_MODIFIED = True
+
+"""
+HOOK_ON_MOVED: ファイルの移動・名前変更時に自動処理するかどうか
+
+デフォルト: True
+よくわからなければ True のままにします
+
+一時ファイルに書き込んでから名前を変えて保存するソフトや、
+別のフォルダから監視フォルダへ移動したPDFも処理できるようにします
+"""
+HOOK_ON_MOVED = True
+
+"""
+SETTLE_SECONDS: ファイルの変更が止まってから処理を始めるまでの秒数
+
+デフォルト: 2.0
+よくわからなければ 2.0 のままにします
+
+保存中のファイル (書き込み途中) を処理しないよう、
+ファイルのサイズと更新日時がこの秒数変わらなくなるまで待ってから処理します。
+大きなファイルの保存やネットワークフォルダへの保存で途中のファイルが処理される場合は増やしてください
+"""
+SETTLE_SECONDS = 2.0
 
 """
 SET_USER_PASSWORD: ユーザーパスワード設定機能を有効かするかどうか
@@ -200,10 +225,90 @@ def encrypt(source_pdf_file: Path, output_folder: Path, owner_password, user_pas
             logger.info("古いファイルをバックアップしました: %s -> %s",
                         dest_pdf_file, bak_dest)
 
-        mode = "xb" if BACKUP_ENABLED else "wb"
-        with dest_pdf_file.open(mode=mode) as dest:
-            pdf_writer.write(dest)
+        # 書き込み途中のPDFが出力先 (共有フォルダ) に見えないよう、
+        # 一時ファイルに書き切ってから名前を変える
+        tmp_file = dest_pdf_file.with_name(dest_pdf_file.name + ".tmp")
+        try:
+            with tmp_file.open(mode="wb") as dest:
+                pdf_writer.write(dest)
+            if BACKUP_ENABLED and dest_pdf_file.exists():
+                raise FileExistsError(f"出力先にファイルが残っています: {dest_pdf_file}")
+            os.replace(tmp_file, dest_pdf_file)
+        finally:
+            if tmp_file.exists():
+                tmp_file.unlink()
         logger.info("パスワードロックしました: %s -> %s", source_pdf_file, dest_pdf_file)
+
+
+class PendingFiles:
+    """
+    処理待ちのファイルを管理します
+
+    ファイル保存中は on_modified が何度も呼ばれるため、すぐには処理せず
+    「サイズと更新日時が SETTLE_SECONDS 秒変わらなくなったら 1 回だけ処理する」ようにします。
+    また、一度処理したときと内容 (サイズと更新日時) が同じファイルは二重に処理しません。
+    """
+
+    def __init__(self, process):
+        self._process = process
+        self._lock = threading.Lock()
+        # パス -> (最後に変化を見た時刻, 最後に見たファイルの状態)
+        self._pending = {}
+        # パス -> 処理したときのファイルの状態
+        self._done = {}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="pdf-worker", daemon=True)
+
+    @staticmethod
+    def _signature(path: str):
+        """ファイルの状態 (サイズ, 更新日時)。ファイルがなければ None"""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_size, st.st_mtime_ns)
+
+    def add(self, path: str):
+        with self._lock:
+            self._pending[path] = (time.monotonic(), self._signature(path))
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join()
+
+    def _run(self):
+        while not self._stop.wait(0.5):
+            for path in self._ready_paths():
+                self._process(path)
+
+    def _ready_paths(self):
+        """変化が止まって処理してよいファイルを取り出します"""
+        ready = []
+        now = time.monotonic()
+        with self._lock:
+            for path, (last_change, last_sig) in list(self._pending.items()):
+                sig = self._signature(path)
+                if sig is None:
+                    # 一時ファイルなど、すでに消えたファイル
+                    del self._pending[path]
+                    continue
+                if sig != last_sig:
+                    # まだ書き込み中: 待ち時間をリセット
+                    self._pending[path] = (now, sig)
+                    continue
+                if now - last_change < SETTLE_SECONDS or sig[0] == 0:
+                    # 変化が止まってから時間が経っていない / 中身がまだ空
+                    continue
+                del self._pending[path]
+                if self._done.get(path) == sig:
+                    logger.debug("処理済みと同じ内容なのでスキップ: %s", path)
+                    continue
+                self._done[path] = sig
+                ready.append(path)
+        return ready
 
 
 class FileEventHandler(LoggingEventHandler):
@@ -214,17 +319,26 @@ class FileEventHandler(LoggingEventHandler):
         self.output_folder = output_folder
         self.owner_password = owner_password
         self.user_password = user_password
+        self.pending = PendingFiles(self.run_encrypt)
 
-    def run_encrypt(self, path: str):
+    def enqueue(self, path):
         """
-        保護スクリプトを実行します
+        PDFなら処理待ちに追加します (実際の処理は PendingFiles が行います)
         """
+        if isinstance(path, bytes):
+            path = os.fsdecode(path)
         if not path.lower().endswith(".pdf"):
             return
         if is_same_or_inside(Path(path).resolve(), Path(self.output_folder).resolve()):
             # SAFE_DIRECTORY = False で起動した場合でも、出力先のファイルは処理しない
             logger.debug("出力先のファイルなのでスキップ: %s", path)
             return
+        self.pending.add(path)
+
+    def run_encrypt(self, path: str):
+        """
+        保護スクリプトを実行します
+        """
         try:
             logger.info("パスワードロックを行います: %s", path)
             encrypt(Path(path), Path(self.output_folder),
@@ -237,11 +351,11 @@ class FileEventHandler(LoggingEventHandler):
         """
         監視対象フォルダにファイルが作成された時の処理です
         """
-        if not HOOK_ON_CREATED:
+        if not HOOK_ON_CREATED or event.is_directory:
             return
         path = event.src_path
         logger.info("ファイル作成: %s", path)
-        self.run_encrypt(path)
+        self.enqueue(path)
         return super().on_created(event)
 
     def on_modified(self, event: FileModifiedEvent):
@@ -249,12 +363,24 @@ class FileEventHandler(LoggingEventHandler):
         監視対象フォルダでファイルが変更された時の処理です
         (新規作成のファイルも含まれるようです)
         """
-        if not HOOK_ON_MODIFIED:
+        if not HOOK_ON_MODIFIED or event.is_directory:
             return
         path = event.src_path
-        logger.info("ファイル変更: %s", path)
-        self.run_encrypt(path)
+        logger.debug("ファイル変更: %s", path)
+        self.enqueue(path)
         return super().on_modified(event)
+
+    def on_moved(self, event: FileMovedEvent):
+        """
+        監視対象フォルダでファイルが移動・名前変更された時の処理です
+        (移動先のパスを処理します)
+        """
+        if not HOOK_ON_MOVED or event.is_directory:
+            return
+        path = event.dest_path
+        logger.info("ファイル移動: %s", path)
+        self.enqueue(path)
+        return super().on_moved(event)
 
 
 def is_same_or_inside(path: Path, folder: Path) -> bool:
@@ -328,6 +454,7 @@ def main():
         path=input_folder,
         recursive=True
     )
+    event_handler.pending.start()
     observer.start()
 
     interrupted = False
@@ -339,6 +466,7 @@ def main():
     finally:
         observer.stop()
         observer.join()
+        event_handler.pending.stop()
 
     logger.info("終了します")
     if interrupted:
